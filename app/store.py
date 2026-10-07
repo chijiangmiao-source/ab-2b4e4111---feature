@@ -68,6 +68,12 @@ CREATE TABLE IF NOT EXISTS journal (
   ts TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_journal_export ON journal(export_id);
+CREATE TABLE IF NOT EXISTS confirmations (
+  export_id TEXT PRIMARY KEY REFERENCES exports(export_id),
+  ack_receipt_id TEXT NOT NULL,
+  ack_digest TEXT NOT NULL,
+  confirmed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS faults (
   export_id TEXT PRIMARY KEY,
   mode TEXT NOT NULL
@@ -242,6 +248,120 @@ def export_events(conn, export_id, limit=50):
         (export_id, limit),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+# -------------------------------------------------------- confirmations
+
+
+def get_confirmation(conn, export_id):
+    row = conn.execute(
+        "SELECT export_id, ack_receipt_id, ack_digest, confirmed_at "
+        "FROM confirmations WHERE export_id = ?",
+        (export_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def confirmations_map(conn, export_ids):
+    """Confirmation rows keyed by export_id (one query for the list view)."""
+    if not export_ids:
+        return {}
+    placeholders = ",".join("?" for _ in export_ids)
+    rows = conn.execute(
+        "SELECT export_id, ack_receipt_id, ack_digest, confirmed_at "
+        "FROM confirmations WHERE export_id IN (%s)" % placeholders,
+        tuple(export_ids),
+    ).fetchall()
+    return {row["export_id"]: dict(row) for row in rows}
+
+
+def confirm_export(conn, export_id, ack_receipt_id, ack_digest, actor="api"):
+    """Adjudicate a receiver confirmation in one IMMEDIATE transaction.
+
+    The request digest must equal the export's *verified* published artifact
+    digest; only then is the single confirmation row written. A retransmitted
+    confirmation (same export + receiver receipt + digest) returns the first
+    result; a different receipt/digest after confirmation, a digest mismatch,
+    or a not-yet-published export is rejected with the original confirmation
+    preserved untouched. Nothing about the artifact, the stage or the frozen
+    evidence is modified.
+
+    Returns (status, outcome, payload): 201 created, 200 retransmitted replay,
+    otherwise 4xx conflict with the first confirmation echoed back.
+    """
+    with immediate(conn):
+        export = get_export(conn, export_id)
+        if export is None:
+            return 404, "not_found", {
+                "error": "not_found",
+                "message": "unknown export_id: %s" % export_id,
+                "export_id": export_id,
+            }
+        if export["stage"] != "PUBLISHED" or not export["artifact_digest"]:
+            journal(conn, export_id, actor, "confirmation_rejected",
+                    "not_published stage=%s receipt=%s" % (export["stage"], ack_receipt_id))
+            return 409, "not_published", {
+                "error": "confirmation_not_published",
+                "message": "export is in stage %s; only a published export can be confirmed"
+                           % export["stage"],
+                "export_id": export_id,
+                "stage": export["stage"],
+            }
+        existing = get_confirmation(conn, export_id)
+        if existing is not None:
+            # Only the exact retransmit (same receipt id AND same digest) is a
+            # replay; anything else conflicts and leaves the first confirmation.
+            if (existing["ack_receipt_id"] == ack_receipt_id
+                    and existing["ack_digest"] == ack_digest):
+                return 200, "replay", _confirmation_result(existing, replay=True)
+            journal(conn, export_id, actor, "confirmation_rejected",
+                    "already_confirmed submitted_receipt=%s first_receipt=%s"
+                    % (ack_receipt_id, existing["ack_receipt_id"]))
+            return 409, "already_confirmed", {
+                "error": "confirmation_conflict",
+                "message": "export is already confirmed with a different receipt/digest; "
+                           "original confirmation preserved",
+                "export_id": export_id,
+                "submitted": {"ack_receipt_id": ack_receipt_id, "ack_digest": ack_digest},
+                "existing": _confirmation_result(existing, replay=False),
+            }
+        if ack_digest != export["artifact_digest"]:
+            # The claimed artifact summary does not match the verified one.
+            journal(conn, export_id, actor, "confirmation_rejected",
+                    "digest_mismatch submitted=%s verified=%s receipt=%s"
+                    % (ack_digest, export["artifact_digest"], ack_receipt_id))
+            return 409, "digest_mismatch", {
+                "error": "confirmation_digest_mismatch",
+                "message": "submitted digest does not match the verified published artifact digest",
+                "export_id": export_id,
+                "submitted": {"ack_digest": ack_digest},
+                "verified": {"artifact_digest": export["artifact_digest"]},
+            }
+        now = utcnow()
+        conn.execute(
+            "INSERT INTO confirmations(export_id, ack_receipt_id, ack_digest, confirmed_at) "
+            "VALUES (?,?,?,?)",
+            (export_id, ack_receipt_id, ack_digest, now),
+        )
+        journal(conn, export_id, actor, "confirmed",
+                "receipt=%s digest=%s" % (ack_receipt_id, ack_digest))
+        result = _confirmation_result(
+            {"export_id": export_id, "ack_receipt_id": ack_receipt_id,
+             "ack_digest": ack_digest, "confirmed_at": now},
+            replay=False,
+        )
+    return 201, "created", result
+
+
+def _confirmation_result(row, replay):
+    return {
+        "export_id": row["export_id"],
+        "confirmation_status": "CONFIRMED",
+        "ack_receipt_id": row["ack_receipt_id"],
+        "ack_digest": row["ack_digest"],
+        "confirmed_at": row["confirmed_at"],
+        "replay": replay,
+    }
 
 
 def get_lease(conn, resource):

@@ -9,11 +9,14 @@ Endpoints:
   GET  /api/exports                    list exports (stage, digests, receipt)
   GET  /api/exports/{id}               detail incl. journal + lease
   GET  /api/exports/{id}/artifact      download (only verified, published)
+  POST /api/exports/{id}/confirmations receiver confirmation (published, digest-verified)
   POST /api/test/fault                 fault injection (TEST_HOOKS=1 only)
+  POST /api/test/restart               exit 0 so the container supervisor restarts us
 """
 import json
 import os
 import re
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -22,6 +25,8 @@ from . import artifacts, config, masking, store
 MAX_BODY = 1 << 20
 MAX_RECORDS = 100
 EXPORT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+ACK_RECEIPT_RE = re.compile(r"^[\w][\w.\-:]{0,127}$", re.UNICODE)
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 INDEX_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "public", "index.html")
 
@@ -51,8 +56,22 @@ def _validate_submission(doc):
     return export_id, records
 
 
-def _public_export(row):
-    return {
+def _validate_confirmation(doc):
+    if not isinstance(doc, dict):
+        raise ApiError(422, "invalid_body", "request body must be a JSON object")
+    ack_receipt_id = doc.get("ack_receipt_id")
+    if not isinstance(ack_receipt_id, str) or not ACK_RECEIPT_RE.match(ack_receipt_id):
+        raise ApiError(422, "invalid_ack_receipt_id",
+                       "ack_receipt_id must be a 1..128 char word/dot/dash/colon identifier")
+    ack_digest = doc.get("ack_digest")
+    if not isinstance(ack_digest, str) or not SHA256_RE.match(ack_digest):
+        raise ApiError(422, "invalid_ack_digest",
+                       "ack_digest must be the 64 lowercase hex sha256 the receiver checked")
+    return ack_receipt_id, ack_digest
+
+
+def _public_export(row, confirmation=None):
+    out = {
         "export_id": row["export_id"],
         "stage": row["stage"],
         "input_digest": row["input_digest"],
@@ -64,6 +83,25 @@ def _public_export(row):
         "published_at": row["published_at"],
         "attempts": row["attempts"],
         "updated_at": row["updated_at"],
+    }
+    out.update(_confirmation_fields(confirmation))
+    return out
+
+
+def _confirmation_fields(confirmation):
+    """The confirmation state is independent of the processing stage."""
+    if confirmation is None:
+        return {
+            "confirmation_status": "UNCONFIRMED",
+            "ack_receipt_id": None,
+            "ack_digest": None,
+            "confirmed_at": None,
+        }
+    return {
+        "confirmation_status": "CONFIRMED",
+        "ack_receipt_id": confirmation["ack_receipt_id"],
+        "ack_digest": confirmation["ack_digest"],
+        "confirmed_at": confirmation["confirmed_at"],
     }
 
 
@@ -151,9 +189,12 @@ class Handler(BaseHTTPRequestHandler):
             conn = store.connect()
             try:
                 rows = store.list_exports(conn)
+                confirms = store.confirmations_map(conn, [row["export_id"] for row in rows])
             finally:
                 conn.close()
-            self._send_json(200, {"exports": [_public_export(row) for row in rows]})
+            self._send_json(200, {
+                "exports": [_public_export(row, confirms.get(row["export_id"])) for row in rows]
+            })
             return
         match = re.fullmatch(r"/api/exports/([A-Za-z0-9._-]+)", path)
         if match:
@@ -185,7 +226,7 @@ class Handler(BaseHTTPRequestHandler):
             if not row:
                 self._send_error_json(404, "not_found", "unknown export_id: %s" % export_id)
                 return
-            payload = _public_export(row)
+            payload = _public_export(row, store.get_confirmation(conn, export_id))
             payload["events"] = store.export_events(conn, export_id)
             lease = store.get_lease(conn, "export:" + export_id)
             payload["lease"] = lease
@@ -224,6 +265,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _confirm_export(self, export_id, doc):
+        ack_receipt_id, ack_digest = _validate_confirmation(doc)
+        conn = store.connect()
+        try:
+            status, _outcome, payload = store.confirm_export(conn, export_id, ack_receipt_id, ack_digest)
+        finally:
+            conn.close()
+        replay = "true" if status == 200 else "false"
+        self._send_json(status, payload, extra_headers={"X-Confirmation-Replay": replay})
+
     # ------------------------------------------------------------ PUT/POST
     def _route_mutation(self, method, path, doc):
         if method == "PUT" and path == "/api/rules":
@@ -251,6 +302,11 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
             self._send_json(status, payload)
             return
+        if method == "POST":
+            match = re.fullmatch(r"/api/exports/([A-Za-z0-9._-]+)/confirmations", path)
+            if match:
+                self._confirm_export(match.group(1), doc)
+                return
         if method == "POST" and path == "/api/test/fault":
             if not config.test_hooks():
                 self._send_error_json(404, "not_found", "test hooks disabled")
@@ -266,6 +322,21 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 conn.close()
             self._send_json(202, {"ok": True, "export_id": export_id, "mode": mode})
+            return
+        if method == "POST" and path == "/api/test/restart":
+            if not config.test_hooks():
+                self._send_error_json(404, "not_found", "test hooks disabled")
+                return
+            self._send_json(202, {"ok": True, "restarting": True})
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+            # Exit after the response is out; the container supervisor restarts
+            # the process against the same persistent volume (acceptance use).
+            def _exit():
+                os._exit(3)
+            threading.Timer(0.5, _exit).start()
             return
         self._send_error_json(404, "not_found", "no such route: %s %s" % (method, path))
 

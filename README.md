@@ -1,8 +1,9 @@
 # 航迹导出服务（track-export）
 
 海洋测绘队向协作方导出航迹前的遮蔽导出服务。值班员在页面上编辑字段遮蔽规则、
-提交带稳定导出标识的少量 JSON 记录，并轮询查看处理阶段、冻结规则摘要与已发布
-工件摘要。纯 Python 3.11 标准库实现（无第三方依赖）。
+提交带稳定导出标识的少量 JSON 记录，并轮询查看处理阶段、冻结规则摘要、已发布
+工件摘要，以及协作方独立的确认状态（未确认/已确认、确认时间、回执标识与确认
+摘要）。纯 Python 3.11 标准库实现（无第三方依赖）。
 
 ## 架构
 
@@ -33,6 +34,13 @@
   文件定期清扫。`PUBLISHED` 为终态，任何路径都不能使其倒退。
 - **唯一发布**：租约串行化 + `artifacts` 表部分唯一索引（每导出仅一条 published）
   + 不可覆盖链接 + 阶段 CAS，四重保证两个 worker 并行时同一导出只发布一次。
+- **接收方确认**：协作方拿到已发布工件后，值班员凭对方的**稳定回执标识**与其
+  **实际核对的工件摘要**提交确认。`POST /api/exports/{id}/confirmations` 在单个
+  `IMMEDIATE` 事务内比对请求摘要与该导出已核验的 `artifact_digest`，一致才写入
+  `confirmations` 中唯一的一行；确认状态（`UNCONFIRMED` / `CONFIRMED`）独立于
+  发布阶段展示。确认不改写下载内容、发布阶段或任何冻结证据。相同导出 + 相同回执
+  + 相同摘要的重传返回首次确认（200，`replay: true`）；摘要不符、导出未发布，或
+  已确认后以不同回执/摘要再提交，均返回 409 并保留原确认。
 
 ## 快速开始（Docker Compose）
 
@@ -54,13 +62,18 @@ docker compose down -v                                   # 重置全部状态
 ## verify 验收内容（执行后退出，退出码即结果）
 
 1. **构建检查**：`python -m compileall app verify tests`
-2. **代码测试**：`python -m unittest discover -s tests`（48 个用例：规范化、遮蔽、
-   裁决/幂等/冲突、阶段单调、租约 fencing、恢复收敛/清理、双 worker 竞态）
+2. **代码测试**：`python -m unittest discover -s tests`（63 个用例：规范化、遮蔽、
+   裁决/幂等/冲突、阶段单调、租约 fencing、恢复收敛/清理、双 worker 竞态、
+   接收方确认裁决/幂等/冲突/并发唯一/持久化）
 3. **API/HTTP 冒烟**：
    - 规则改动后，已冻结导出仍按冻结快照导出（E1 用 R1、E2 用 R2，互不影响）
    - 崩溃恢复：暂存完整后崩溃 → 收敛到同一完整工件；写一半崩溃 → 清理残缺并重处理
    - 业务等价重传 → 首次回执且无第二个工件；记录/规则快照不同 → 409 且证据保留
    - 下载接口在崩溃窗口内只返回 409，绝不暴露未核验内容
+   - 接收方确认：独立的未确认/已确认状态与确认时间、回执标识、确认摘要；未发布或
+     摘要不符 → 409；相同回执+摘要重传 → 首次确认；已确认后换回执/摘要 → 409 且
+     原确认保留；6 路并发只形成一条确认；**服务重启后页面仍读到同一结果**；重启后
+     下载回归全部通过
 
 ## 本地开发（无 Docker）
 
@@ -76,10 +89,12 @@ python3 -m unittest discover -s tests -t .     # 单元测试
 | GET | `/healthz` | 健康响应 |
 | GET/PUT | `/api/rules` | 查看 / 替换当前遮蔽规则（版本+摘要） |
 | POST | `/api/exports` | 提交 `{export_id, records}` → 201 / 200(replay) / 409(conflict) |
-| GET | `/api/exports` | 列表：阶段、冻结规则摘要、输入摘要、工件摘要 |
-| GET | `/api/exports/{id}` | 详情 + 处理日志 + 当前租约 |
+| GET | `/api/exports` | 列表：阶段、确认状态、冻结规则摘要、输入摘要、工件摘要、确认回执/摘要/时间 |
+| GET | `/api/exports/{id}` | 详情 + 确认状态/回执/摘要/时间 + 处理日志 + 当前租约 |
 | GET | `/api/exports/{id}/artifact` | 下载已发布工件（摘要核验，否则 409/410/500） |
+| POST | `/api/exports/{id}/confirmations` | 接收方确认 `{ack_receipt_id, ack_digest}` → 201 / 200(replay) / 409(未发布/摘要不符/确认冲突) / 404 |
 | POST | `/api/test/fault` | 故障注入（仅 `TEST_HOOKS=1`）：`crash_partial_write` / `crash_after_staged` |
+| POST | `/api/test/restart` | 重启 app 进程（仅 `TEST_HOOKS=1`，验收确认持久化用） |
 
 ## 配置（环境变量）
 

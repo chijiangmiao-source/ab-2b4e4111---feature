@@ -35,6 +35,8 @@
   .st-RECEIVED  { background:#e8eef7; color:var(--info); }
   .st-PROCESSING, .st-STAGED { background:#fff3d6; color:var(--warn); }
   .st-PUBLISHED { background:#dff2e5; color:var(--ok); }
+  .cf-UNCONFIRMED { background:#eceff3; color:var(--muted); }
+  .cf-CONFIRMED { background:#dff2e5; color:var(--ok); }
   pre { background:#0f1620; color:#d7e3f4; border-radius:6px; padding:10px; font-size:11.5px;
         max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
   .err { color:var(--bad); } .ok { color:var(--ok); }
@@ -46,7 +48,7 @@
 <body>
 <header>
   <h1>航迹导出值班台</h1>
-  <p>编辑字段遮蔽规则 → 提交带稳定标识的航迹记录 → 轮询处理阶段 / 冻结规则摘要 / 已发布工件摘要</p>
+  <p>编辑字段遮蔽规则 → 提交带稳定标识的航迹记录 → 轮询发布阶段 / 冻结规则摘要 / 已发布工件摘要 → 记录协作方独立的确认回执与核对摘要</p>
 </header>
 <main>
   <section>
@@ -73,15 +75,28 @@
     <h2>③ 导出列表（每 2 秒轮询真实 API）</h2>
     <table>
       <thead><tr>
-        <th>导出标识</th><th>阶段</th><th>冻结规则摘要</th><th>输入摘要</th>
-        <th>已发布工件摘要</th><th>尝试</th><th>更新时间</th><th>操作</th>
+        <th>导出标识</th><th>发布阶段</th><th>确认状态</th><th>冻结规则摘要</th><th>输入摘要</th>
+        <th>已发布工件摘要</th><th>确认回执标识</th><th>确认摘要</th><th>确认时间</th><th>尝试</th><th>操作</th>
       </tr></thead>
-      <tbody id="rows"><tr><td colspan="8" class="meta">加载中…</td></tr></tbody>
+      <tbody id="rows"><tr><td colspan="11" class="meta">加载中…</td></tr></tbody>
     </table>
   </section>
 
-  <section class="wide">
-    <h2>④ 处理日志 / 租约 <span class="meta" id="detailFor"></span></h2>
+  <section>
+    <h2>④ 接收方确认（仅已发布导出可提交一次）</h2>
+    <label for="confirmId">导出标识 export_id</label>
+    <input type="text" id="confirmId" value="">
+    <label for="ackReceipt">对方确认的稳定回执标识 ack_receipt_id</label>
+    <input type="text" id="ackReceipt" value="" placeholder="例如 partner-rcpt-20261007-0001">
+    <label for="ackDigest">对方实际核对的工件摘要 ack_digest（64 位 sha256）</label>
+    <input type="text" id="ackDigest" class="mono" value="" placeholder="须与已发布工件摘要完全一致">
+    <button id="submitConfirm">提交确认</button>
+    <div class="meta" id="confirmMsg"></div>
+    <pre id="confirmResult" hidden></pre>
+  </section>
+
+  <section>
+    <h2>⑤ 处理日志 / 租约 <span class="meta" id="detailFor"></span></h2>
     <div id="lease" class="meta"></div>
     <pre id="events">点击列表中的“日志”查看。</pre>
   </section>
@@ -143,27 +158,80 @@ async function refreshExports() {
   const rows = data.exports.map(e => {
     const dl = e.stage === "PUBLISHED"
       ? `<a href="/api/exports/${encodeURIComponent(e.export_id)}/artifact">下载</a>` : "—";
+    const confirmed = e.confirmation_status === "CONFIRMED";
+    const fill = confirmed ? `useConfirm('${e.export_id}', '${e.ack_receipt_id}', '${e.ack_digest}')` : "";
+    const confirmLink = e.stage === "PUBLISHED" && !confirmed
+      ? `<a href="#" onclick="primeConfirm('${e.export_id}', '${e.artifact_digest || ""}');return false;">确认</a>`
+      : (confirmed ? `<a href="#" onclick="${fill};return false;">回填</a>` : "—");
     return `<tr>
       <td class="mono">${e.export_id}</td>
       <td><span class="badge st-${e.stage}">${e.stage}</span></td>
+      <td><span class="badge cf-${e.confirmation_status}">${e.confirmation_status}</span></td>
       <td class="mono" title="${e.rules_digest}">${short(e.rules_digest)} (v${e.rules_version})</td>
       <td class="mono" title="${e.input_digest}">${short(e.input_digest)}</td>
       <td class="mono" title="${e.artifact_digest || ""}">${short(e.artifact_digest)}</td>
+      <td class="mono" title="${e.ack_receipt_id || ""}">${e.ack_receipt_id || "—"}</td>
+      <td class="mono" title="${e.ack_digest || ""}">${short(e.ack_digest)}</td>
+      <td class="mono">${e.confirmed_at || "—"}</td>
       <td>${e.attempts}</td>
-      <td class="mono">${e.updated_at}</td>
-      <td>${dl} · <a href="#" onclick="showDetail('${e.export_id}');return false;">日志</a></td>
+      <td>${dl} · ${confirmLink} · <a href="#" onclick="showDetail('${e.export_id}');return false;">日志</a></td>
     </tr>`;
   }).join("");
-  $("rows").innerHTML = rows || `<tr><td colspan="8" class="meta">暂无导出。</td></tr>`;
+  $("rows").innerHTML = rows || `<tr><td colspan="11" class="meta">暂无导出。</td></tr>`;
 }
+
+function primeConfirm(exportId, digest) {
+  $("confirmId").value = exportId;
+  $("ackDigest").value = digest || "";
+  $("ackReceipt").focus();
+}
+
+function useConfirm(exportId, receipt, digest) {
+  primeConfirm(exportId, digest);
+  $("ackReceipt").value = receipt || "";
+}
+window.primeConfirm = primeConfirm;
+window.useConfirm = useConfirm;
+
+$("submitConfirm").onclick = async () => {
+  $("confirmMsg").textContent = ""; $("confirmResult").hidden = true;
+  const exportId = $("confirmId").value.trim();
+  if (!exportId) {
+    $("confirmMsg").innerHTML = "<span class='err'>请填写导出标识。</span>";
+    return;
+  }
+  const { status, data } = await api("POST",
+    "/api/exports/" + encodeURIComponent(exportId) + "/confirmations",
+    {
+      ack_receipt_id: $("ackReceipt").value.trim(),
+      ack_digest: $("ackDigest").value.trim(),
+    });
+  $("confirmResult").hidden = false;
+  $("confirmResult").textContent = "HTTP " + status + "\n" + JSON.stringify(data, null, 2);
+  if (status === 201) $("confirmMsg").innerHTML = "<span class='ok'>确认已写入：接收方回执与工件摘要核对一致。</span>";
+  else if (status === 200) $("confirmMsg").innerHTML = "<span class='ok'>相同回执与摘要的重传：返回首次确认结果，未重复写入。</span>";
+  else if (status === 409 && data.error === "confirmation_digest_mismatch")
+    $("confirmMsg").innerHTML = "<span class='err'>冲突：提交摘要与已核验工件摘要不一致，未写入确认。</span>";
+  else if (status === 409 && data.error === "confirmation_conflict")
+    $("confirmMsg").innerHTML = "<span class='err'>冲突：该导出已由不同回执/摘要确认，原确认保留。</span>";
+  else if (status === 409) $("confirmMsg").innerHTML = "<span class='err'>导出尚未发布，不能确认。</span>";
+  else $("confirmMsg").innerHTML = "<span class='err'>确认失败：" + (data.message || status) + "</span>";
+  refreshExports();
+};
 
 async function showDetail(exportId) {
   const { status, data } = await api("GET", "/api/exports/" + encodeURIComponent(exportId));
   if (status !== 200) return;
   $("detailFor").textContent = "— " + exportId;
-  $("lease").innerHTML = data.lease
+  const confirmed = data.confirmation_status === "CONFIRMED";
+  const confirmLine = confirmed
+    ? "确认状态：<span class='badge cf-CONFIRMED'>CONFIRMED</span> · 回执标识 <b class='mono'>"
+      + data.ack_receipt_id + "</b> · 确认摘要 <b class='mono' title='" + data.ack_digest + "'>"
+      + data.ack_digest + "</b> · 确认时间 <b class='mono'>" + data.confirmed_at + "</b>"
+    : "确认状态：<span class='badge cf-UNCONFIRMED'>UNCONFIRMED</span>（协作方尚未确认）";
+  $("lease").innerHTML = confirmLine + "<br>" + (data.lease
     ? "当前租约持有者：<b class='mono'>" + data.lease.owner + "</b>（fencing=" + data.lease.fencing + "，到期 " + new Date(data.lease.expires_at * 1000).toISOString() + "）"
-    : "当前无有效租约。";
+    : "当前无有效租约。");
   $("events").textContent = data.events.map(e => `${e.ts}  [${e.actor}]  ${e.event}${e.detail ? "  — " + e.detail : ""}`).join("\n") || "（无事件）";
 }
 window.showDetail = showDetail;
