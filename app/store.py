@@ -72,6 +72,13 @@ CREATE TABLE IF NOT EXISTS faults (
   export_id TEXT PRIMARY KEY,
   mode TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS confirmations (
+  export_id TEXT PRIMARY KEY,
+  receipt_id TEXT NOT NULL,
+  artifact_digest TEXT NOT NULL,
+  confirmed_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 """
 
 DEFAULT_RULES = {"rules": [{"field": "vessel_id", "action": "hash", "length": 12}]}
@@ -290,6 +297,130 @@ def mark_published(conn, export_id, digest, path, actor, via):
     )
     journal(conn, export_id, actor, "published", "digest=%s via=%s" % (digest, via))
     return True
+
+
+# ------------------------------------------------------------ confirmations
+
+def get_confirmation(conn, export_id):
+    row = conn.execute(
+        "SELECT export_id, receipt_id, artifact_digest, confirmed_at FROM confirmations WHERE export_id = ?",
+        (export_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_confirmations(conn):
+    rows = conn.execute(
+        "SELECT export_id, receipt_id, artifact_digest, confirmed_at FROM confirmations"
+    ).fetchall()
+    return {row["export_id"]: dict(row) for row in rows}
+
+
+def confirm_receipt(conn, export_id, receipt_id, artifact_digest, actor="api"):
+    """Adjudicate a receiver confirmation in one IMMEDIATE transaction.
+
+    The request digest must exactly equal the export's already-verified
+    published artifact digest; only a PUBLISHED export can be confirmed, and an
+    export can be confirmed at most once. Nothing here touches the artifact
+    bytes, the stage, or the frozen evidence.
+
+    Returns (status, payload):
+      201 first confirmation written
+      200 idempotent replay of the first confirmation (same receipt + digest)
+      404 unknown export
+      409 export not published, digest mismatch, or a different receipt/digest
+          re-submitted after confirmation (the original confirmation is kept)
+    """
+    with immediate(conn):
+        export = get_export(conn, export_id)
+        if export is None:
+            return 404, {
+                "error": "not_found",
+                "message": "unknown export_id: %s" % export_id,
+                "export_id": export_id,
+            }
+        existing = get_confirmation(conn, export_id)
+        if existing is not None:
+            if existing["receipt_id"] == receipt_id and existing["artifact_digest"] == artifact_digest:
+                return 200, _confirmation_payload(export, existing, replay=True)
+            journal(
+                conn, export_id, actor, "confirm_conflict",
+                "submitted_receipt=%s submitted_digest=%s" % (receipt_id, artifact_digest),
+            )
+            return 409, {
+                "error": "conflict",
+                "message": "export is already confirmed; the original confirmation is preserved",
+                "export_id": export_id,
+                "submitted": {"receipt_id": receipt_id, "artifact_digest": artifact_digest},
+                "existing": {
+                    "receipt_id": existing["receipt_id"],
+                    "artifact_digest": existing["artifact_digest"],
+                    "confirmed_at": existing["confirmed_at"],
+                },
+            }
+        if export["stage"] != "PUBLISHED":
+            return 409, {
+                "error": "not_published",
+                "message": "export is in stage %s; only published exports can be confirmed" % export["stage"],
+                "export_id": export_id,
+                "stage": export["stage"],
+            }
+        if not export["artifact_digest"] or artifact_digest != export["artifact_digest"]:
+            journal(
+                conn, export_id, actor, "confirm_rejected",
+                "submitted_digest=%s verified_digest=%s"
+                % (artifact_digest, export["artifact_digest"]),
+            )
+            return 409, {
+                "error": "digest_mismatch",
+                "message": "submitted digest does not match the export's verified artifact digest",
+                "export_id": export_id,
+                "submitted": {"artifact_digest": artifact_digest},
+                "expected": {"artifact_digest": export["artifact_digest"]},
+            }
+        now = utcnow()
+        conn.execute(
+            """INSERT INTO confirmations(export_id, receipt_id, artifact_digest, confirmed_at, created_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(export_id) DO NOTHING""",
+            (export_id, receipt_id, artifact_digest, now, now),
+        )
+        saved = get_confirmation(conn, export_id)
+        # Under the IMMEDIATE write lock a divergent row cannot appear between
+        # the SELECT above and this INSERT; if one did surface, adjudicate it
+        # by the same replay/conflict rules instead of overwriting it.
+        if saved["receipt_id"] != receipt_id or saved["artifact_digest"] != artifact_digest:
+            journal(
+                conn, export_id, actor, "confirm_conflict",
+                "submitted_receipt=%s submitted_digest=%s (race)" % (receipt_id, artifact_digest),
+            )
+            return 409, {
+                "error": "conflict",
+                "message": "export is already confirmed; the original confirmation is preserved",
+                "export_id": export_id,
+                "submitted": {"receipt_id": receipt_id, "artifact_digest": artifact_digest},
+                "existing": {
+                    "receipt_id": saved["receipt_id"],
+                    "artifact_digest": saved["artifact_digest"],
+                    "confirmed_at": saved["confirmed_at"],
+                },
+            }
+        journal(
+            conn, export_id, actor, "confirmed",
+            "receipt=%s digest=%s" % (receipt_id, artifact_digest),
+        )
+        return 201, _confirmation_payload(export, saved, replay=False)
+
+
+def _confirmation_payload(export_row, confirmation, replay):
+    return {
+        "export_id": export_row["export_id"],
+        "status": "CONFIRMED",
+        "receipt_id": confirmation["receipt_id"],
+        "artifact_digest": confirmation["artifact_digest"],
+        "confirmed_at": confirmation["confirmed_at"],
+        "replay": replay,
+    }
 
 
 # ---------------------------------------------------------------- leases

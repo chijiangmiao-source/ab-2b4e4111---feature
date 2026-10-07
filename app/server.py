@@ -6,9 +6,11 @@ Endpoints:
   GET  /api/rules                      current masking rules + digest
   PUT  /api/rules                      replace masking rules
   POST /api/exports                    submit records under a stable export id
-  GET  /api/exports                    list exports (stage, digests, receipt)
-  GET  /api/exports/{id}               detail incl. journal + lease
+  GET  /api/exports                    list exports (stage, digests, receipt, confirmation)
+  GET  /api/exports/{id}               detail incl. journal + lease + confirmation
   GET  /api/exports/{id}/artifact      download (only verified, published)
+  POST /api/exports/{id}/confirmation  receiver confirms stable receipt + checked digest
+                                       (201 first / 200 replay / 409 conflict / 404 unknown)
   POST /api/test/fault                 fault injection (TEST_HOOKS=1 only)
 """
 import json
@@ -22,6 +24,8 @@ from . import artifacts, config, masking, store
 MAX_BODY = 1 << 20
 MAX_RECORDS = 100
 EXPORT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+RECEIPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 INDEX_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "public", "index.html")
 
@@ -51,7 +55,21 @@ def _validate_submission(doc):
     return export_id, records
 
 
-def _public_export(row):
+def _validate_confirmation(doc):
+    if not isinstance(doc, dict):
+        raise ApiError(422, "invalid_body", "request body must be a JSON object")
+    receipt_id = doc.get("receipt_id")
+    if not isinstance(receipt_id, str) or not RECEIPT_ID_RE.match(receipt_id):
+        raise ApiError(422, "invalid_receipt_id",
+                       "receipt_id must match %s" % RECEIPT_ID_RE.pattern)
+    artifact_digest = doc.get("artifact_digest")
+    if not isinstance(artifact_digest, str) or not SHA256_RE.match(artifact_digest):
+        raise ApiError(422, "invalid_artifact_digest",
+                       "artifact_digest must be a 64-char lowercase hex sha256")
+    return receipt_id, artifact_digest
+
+
+def _public_export(row, confirmation=None):
     return {
         "export_id": row["export_id"],
         "stage": row["stage"],
@@ -64,6 +82,23 @@ def _public_export(row):
         "published_at": row["published_at"],
         "attempts": row["attempts"],
         "updated_at": row["updated_at"],
+        "confirmation": _confirmation_view(confirmation),
+    }
+
+
+def _confirmation_view(confirmation):
+    if not confirmation:
+        return {
+            "status": "UNCONFIRMED",
+            "receipt_id": None,
+            "artifact_digest": None,
+            "confirmed_at": None,
+        }
+    return {
+        "status": "CONFIRMED",
+        "receipt_id": confirmation["receipt_id"],
+        "artifact_digest": confirmation["artifact_digest"],
+        "confirmed_at": confirmation["confirmed_at"],
     }
 
 
@@ -151,9 +186,14 @@ class Handler(BaseHTTPRequestHandler):
             conn = store.connect()
             try:
                 rows = store.list_exports(conn)
+                confirmations = store.list_confirmations(conn)
             finally:
                 conn.close()
-            self._send_json(200, {"exports": [_public_export(row) for row in rows]})
+            self._send_json(200, {
+                "exports": [
+                    _public_export(row, confirmations.get(row["export_id"])) for row in rows
+                ],
+            })
             return
         match = re.fullmatch(r"/api/exports/([A-Za-z0-9._-]+)", path)
         if match:
@@ -185,7 +225,7 @@ class Handler(BaseHTTPRequestHandler):
             if not row:
                 self._send_error_json(404, "not_found", "unknown export_id: %s" % export_id)
                 return
-            payload = _public_export(row)
+            payload = _public_export(row, store.get_confirmation(conn, export_id))
             payload["events"] = store.export_events(conn, export_id)
             lease = store.get_lease(conn, "export:" + export_id)
             payload["lease"] = lease
@@ -224,6 +264,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _confirm_export(self, export_id, doc):
+        receipt_id, artifact_digest = _validate_confirmation(doc)
+        conn = store.connect()
+        try:
+            status, payload = store.confirm_receipt(conn, export_id, receipt_id, artifact_digest)
+        finally:
+            conn.close()
+        self._send_json(status, payload)
+
     # ------------------------------------------------------------ PUT/POST
     def _route_mutation(self, method, path, doc):
         if method == "PUT" and path == "/api/rules":
@@ -250,6 +299,10 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 conn.close()
             self._send_json(status, payload)
+            return
+        match = re.fullmatch(r"/api/exports/([A-Za-z0-9._-]+)/confirmation", path)
+        if method == "POST" and match:
+            self._confirm_export(match.group(1), doc)
             return
         if method == "POST" and path == "/api/test/fault":
             if not config.test_hooks():

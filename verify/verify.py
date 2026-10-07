@@ -7,6 +7,12 @@ the live HTTP API through the required scenarios:
   2. crash recovery (converge a complete staged artifact; clean up a partial one)
   3. business-equivalent retransmission (first receipt, no second artifact)
      and conflict handling (different records or rules snapshot)
+  4. receiver stable-receipt confirmations: unconfirmed/confirmed status,
+     one-shot adjudication, digest conflicts, idempotent replay, concurrent
+     submissions, and durability after an app restart
+
+VERIFY_PHASE=restart runs only the post-restart persistence checks; the
+default phase runs everything (and scripts/verify.sh orchestrates the restart).
 
 Exits 0 when everything passes, 1 otherwise.
 """
@@ -19,10 +25,14 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 API = os.environ.get("API_BASE", "http://localhost:8080").rstrip("/")
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VERIFY_PHASE = os.environ.get("VERIFY_PHASE", "main")
+VERIFY_STATE_DIR = os.environ.get("VERIFY_STATE_DIR", os.path.join(REPO_ROOT, ".verify-state"))
+CONFIRM_STATE_FILE = os.path.join(VERIFY_STATE_DIR, "confirmations.json")
 RUN = uuid.uuid4().hex[:6]
 
 FAILURES = []
@@ -93,6 +103,29 @@ def download(export_id):
     return req("GET", "/api/exports/%s/artifact" % export_id)
 
 
+def confirm(export_id, receipt_id, digest):
+    return req("POST", "/api/exports/%s/confirmation" % export_id,
+               {"receipt_id": receipt_id, "artifact_digest": digest})
+
+
+def confirm_view(export_id):
+    status, raw, _ = req("GET", "/api/exports/" + export_id)
+    if status != 200:
+        return None
+    return as_json(raw).get("confirmation")
+
+
+def save_confirm_state(state):
+    os.makedirs(VERIFY_STATE_DIR, exist_ok=True)
+    with open(CONFIRM_STATE_FILE, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+
+
+def load_confirm_state():
+    with open(CONFIRM_STATE_FILE, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
 # ------------------------------------------------------------------ phases
 
 def build_checks():
@@ -136,7 +169,7 @@ def wait_for_api():
 
 
 def smoke():
-    e1, e2, e3, e4, e5 = ("VFY%d-%s" % (i, RUN) for i in range(1, 6))
+    e1, e2, e3, e4, e5, e6, e7, e8 = ("VFY%d-%s" % (i, RUN) for i in range(1, 9))
     recs = [
         {"ts": "2026-10-06T01:00:00Z", "lat": 31.230416, "lon": 121.473701, "depth_m": 42.51, "vessel_id": "HAICE-01"},
         {"ts": "2026-10-06T01:05:00Z", "lat": 31.231102, "lon": 121.480233, "depth_m": 43.04, "vessel_id": "HAICE-01"},
@@ -306,19 +339,204 @@ def smoke():
           detail2b is not None and detail2b["artifact_digest"] == detail2["artifact_digest"])
     check("exactly one published artifact file for E2", len(published_files(e2)) == 1)
 
+    step("接收方确认：未发布/摘要不符 → 409 冲突，且原证据不变")
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e6, "records": recs})
+    check("submit E6 -> 201", status == 201)
+    status, raw, _ = confirm(e6, "ack-%s-1" % RUN, "0" * 64)
+    check("confirm unpublished E6 -> 409", status == 409, "HTTP %s %s" % (status, raw[:200]))
+    check("rejected confirm reports not_published", as_json(raw).get("error") == "not_published")
+    view = confirm_view(e6)
+    check("E6 stays UNCONFIRMED after rejection", view and view.get("status") == "UNCONFIRMED")
+
+    detail6 = wait_for_stage(e6, "PUBLISHED", 90)
+    check("E6 published", detail6 is not None and detail6["stage"] == "PUBLISHED")
+    digest6 = detail6["artifact_digest"] if detail6 else None
+
+    status, raw, _ = confirm(e6, "ack-%s-1" % RUN, "f" * 64)
+    check("confirm with wrong digest -> 409", status == 409)
+    check("wrong digest reports digest_mismatch", as_json(raw).get("error") == "digest_mismatch")
+    status, raw, _ = req("POST", "/api/exports/NOPE-%s/confirmation" % RUN,
+                         {"receipt_id": "x", "artifact_digest": "0" * 64})
+    check("confirm unknown export -> 404", status == 404)
+
+    step("接收方确认：摘要完全一致 → 201 首次确认（独立状态/时间/回执/摘要）")
+    status, raw, _ = confirm(e6, "ack-%s-1" % RUN, digest6)
+    first_confirm = as_json(raw)
+    check("first confirm E6 -> 201", status == 201, "HTTP %s %s" % (status, raw[:200]))
+    check("confirm payload fields",
+          first_confirm.get("status") == "CONFIRMED"
+          and first_confirm.get("receipt_id") == "ack-%s-1" % RUN
+          and first_confirm.get("artifact_digest") == digest6
+          and bool(first_confirm.get("confirmed_at"))
+          and first_confirm.get("replay") is False)
+    view = confirm_view(e6)
+    check("detail shows CONFIRMED with time/receipt/digest",
+          view and view.get("status") == "CONFIRMED"
+          and view.get("receipt_id") == "ack-%s-1" % RUN
+          and view.get("artifact_digest") == digest6
+          and view.get("confirmed_at") == first_confirm["confirmed_at"])
+    status, raw, _ = req("GET", "/api/exports")
+    listing = as_json(raw)["exports"]
+    row6 = next(e for e in listing if e["export_id"] == e6)
+    unconfirmed = [e["export_id"] for e in listing if e["confirmation"]["status"] == "UNCONFIRMED"]
+    check("list carries per-export confirmation status",
+          row6["confirmation"]["status"] == "CONFIRMED"
+          and row6["confirmation"]["confirmed_at"] == first_confirm["confirmed_at"]
+          and any(eid in unconfirmed for eid in (e1, e2, e3, e4, e5)))
+
+    step("相同导出+回执+摘要重传 → 200 首次确认结果；不同回执/摘要 → 409 且保留原确认")
+    status, raw, _ = confirm(e6, "ack-%s-1" % RUN, digest6)
+    replay = as_json(raw)
+    check("identical retransmit -> 200 replay", status == 200 and replay.get("replay") is True)
+    check("replay returns first confirmation",
+          replay.get("confirmed_at") == first_confirm["confirmed_at"]
+          and replay.get("receipt_id") == first_confirm["receipt_id"])
+    status, raw, _ = confirm(e6, "ack-%s-2" % RUN, digest6)
+    check("different receipt -> 409", status == 409 and as_json(raw).get("error") == "conflict")
+    check("conflict echoes original receipt",
+          as_json(raw).get("existing", {}).get("receipt_id") == "ack-%s-1" % RUN)
+    status, raw, _ = confirm(e6, "ack-%s-1" % RUN, "f" * 64)
+    check("different digest -> 409", status == 409 and as_json(raw).get("error") == "conflict")
+    view = confirm_view(e6)
+    check("original confirmation preserved",
+          view and view.get("receipt_id") == "ack-%s-1" % RUN
+          and view.get("artifact_digest") == digest6
+          and view.get("confirmed_at") == first_confirm["confirmed_at"])
+
+    step("确认不改写下载内容 / 发布阶段 / 冻结证据")
+    status, raw, _ = download(e6)
+    check("download E6 still verified after confirmation",
+          status == 200 and hashlib.sha256(raw).hexdigest() == digest6)
+    detail6b = wait_for_stage(e6, "PUBLISHED", 5)
+    check("E6 stage/digest/published_at unchanged",
+          detail6b is not None and detail6b["stage"] == "PUBLISHED"
+          and detail6b["artifact_digest"] == digest6
+          and detail6b["published_at"] == detail6["published_at"])
+    check("exactly one published artifact file for E6", len(published_files(e6)) == 1)
+
+    step("并发确认同一导出（相同与不同回执混合）→ 仅一条确认记录")
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e7, "records": recs})
+    check("submit E7 -> 201", status == 201)
+    detail7 = wait_for_stage(e7, "PUBLISHED", 90)
+    check("E7 published", detail7 is not None and detail7["stage"] == "PUBLISHED")
+    digest7 = detail7["artifact_digest"] if detail7 else None
+    receipts = ["ack-%s-same" % RUN] * 3 + ["ack-%s-other-%d" % (RUN, i) for i in range(3)]
+
+    def hammer(receipt_id):
+        return confirm(e7, receipt_id, digest7)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        hammered = list(pool.map(hammer, receipts))
+    codes = sorted(code for code, _, _ in hammered)
+    check("concurrent confirms: exactly one 201, rest 200/409",
+          codes.count(201) == 1 and codes.count(200) == 2 and codes.count(409) == 3,
+          str(codes))
+    view = confirm_view(e7)
+    check("E7 has the single winning confirmation",
+          view and view.get("status") == "CONFIRMED" and view.get("artifact_digest") == digest7)
+    winning = view.get("receipt_id") if view else None
+    # every identical retransmit, winner included once, reads back the same row
+    status, raw, _ = confirm(e7, "ack-%s-same" % RUN, digest7)
+    check("post-race identical retransmit is idempotent",
+          status in (200,) and as_json(raw).get("confirmed_at") == view.get("confirmed_at"))
+    check("winning receipt is one of the submitted ones",
+          winning in receipts, str(winning))
+
+    step("为重启后的持久化检查准备 E8 确认")
+    status, raw, _ = req("POST", "/api/exports", {"export_id": e8, "records": recs})
+    check("submit E8 -> 201", status == 201)
+    detail8 = wait_for_stage(e8, "PUBLISHED", 90)
+    check("E8 published", detail8 is not None and detail8["stage"] == "PUBLISHED")
+    digest8 = detail8["artifact_digest"] if detail8 else None
+    status, raw, _ = confirm(e8, "ack-%s-restart" % RUN, digest8)
+    check("confirm E8 -> 201 before restart", status == 201)
+    confirm8_at = as_json(raw)["confirmed_at"]
+    save_confirm_state({
+        "e6": {"id": e6, "receipt": "ack-%s-1" % RUN, "digest": digest6,
+               "confirmed_at": first_confirm["confirmed_at"]},
+        "e7": {"id": e7, "receipt": winning, "digest": digest7},
+        "e8": {"id": e8, "receipt": "ack-%s-restart" % RUN, "digest": digest8,
+               "confirmed_at": confirm8_at},
+    })
+
     step("终态检查：无残缺临时工件残留")
     leftovers = []
-    for eid in (e1, e2, e3, e4, e5):
+    for eid in (e1, e2, e3, e4, e5, e6, e7, e8):
         leftovers.extend(tmp_files(eid))
     check("no temp artifacts left behind", leftovers == [], str(leftovers))
 
 
+def restart_phase():
+    """Runs against a freshly restarted app: confirmations durably survive."""
+    state = load_confirm_state()
+    step("重启后：已确认结果仍为同一条记录（状态/时间/回执/摘要）")
+    for key in ("e6", "e7", "e8"):
+        item = state[key]
+        eid = item["id"]
+        status, raw, _ = req("GET", "/api/exports/" + eid)
+        check("%s detail readable after restart" % key, status == 200)
+        if status != 200:
+            continue
+        detail = as_json(raw)
+        view = detail.get("confirmation")
+        ok = (
+            detail["stage"] == "PUBLISHED"
+            and view and view.get("status") == "CONFIRMED"
+            and view.get("receipt_id") == item["receipt"]
+            and view.get("artifact_digest") == item["digest"] == detail["artifact_digest"]
+        )
+        if "confirmed_at" in item:
+            ok = ok and view.get("confirmed_at") == item["confirmed_at"]
+        check("%s confirmation unchanged after restart" % key, ok,
+              "detail=%s" % json.dumps(detail, ensure_ascii=False)[:400])
+        code, body, _ = download(eid)
+        check("%s download still verified after restart" % key,
+              code == 200 and hashlib.sha256(body).hexdigest() == item["digest"],
+              "HTTP %s" % code)
+        # same receipt + same digest retransmitted post-restart -> first result
+        code, body, _ = confirm(eid, item["receipt"], item["digest"])
+        replay = as_json(body)
+        check("%s identical retransmit after restart -> 200 first result" % key,
+              code == 200 and replay.get("replay") is True
+              and replay.get("receipt_id") == item["receipt"]
+              and replay.get("artifact_digest") == item["digest"],
+              "HTTP %s %s" % (code, body[:200]))
+        # a different receipt post-restart is still a conflict, original kept
+        code, body, _ = confirm(eid, "ack-%s-post-restart" % RUN, item["digest"])
+        check("%s different receipt after restart -> 409" % key,
+              code == 409 and as_json(body).get("existing", {}).get("receipt_id") == item["receipt"])
+        view2 = confirm_view(eid)
+        check("%s original confirmation still preserved after restart" % key,
+              view2 and view2.get("receipt_id") == item["receipt"])
+
+    step("重启后：列表接口仍展示独立的未确认/已确认状态")
+    status, raw, _ = req("GET", "/api/exports")
+    check("list readable after restart", status == 200)
+    if status == 200:
+        rows = {e["export_id"]: e for e in as_json(raw)["exports"]}
+        for key in ("e6", "e7", "e8"):
+            eid = state[key]["id"]
+            check("%s listed CONFIRMED after restart" % key,
+                  eid in rows and rows[eid]["confirmation"]["status"] == "CONFIRMED"
+                  and rows[eid]["confirmation"]["receipt_id"] == state[key]["receipt"])
+        # an export from the main run that was never confirmed stays UNCONFIRMED
+        others = [e for eid, e in rows.items()
+                  if e["stage"] == "PUBLISHED" and e["confirmation"]["status"] == "UNCONFIRMED"]
+        check("at least one published export remains UNCONFIRMED", bool(others))
+
+
 def main():
-    print("verify: one-shot acceptance run %s against %s" % (RUN, API), flush=True)
-    build_checks()
-    unit_tests()
-    wait_for_api()
-    smoke()
+    print("verify: one-shot acceptance run %s against %s (phase=%s)"
+          % (RUN, API, VERIFY_PHASE), flush=True)
+    if VERIFY_PHASE == "restart":
+        # Post-restart persistence phase: no build/unit tests are rerun.
+        wait_for_api()
+        restart_phase()
+    else:
+        build_checks()
+        unit_tests()
+        wait_for_api()
+        smoke()
     print("\n==============================================")
     if FAILURES:
         print("verify: FAILED (%d): %s" % (len(FAILURES), ", ".join(FAILURES)), flush=True)

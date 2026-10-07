@@ -35,6 +35,8 @@
   .st-RECEIVED  { background:#e8eef7; color:var(--info); }
   .st-PROCESSING, .st-STAGED { background:#fff3d6; color:var(--warn); }
   .st-PUBLISHED { background:#dff2e5; color:var(--ok); }
+  .cf-UNCONFIRMED { background:#eceff3; color:var(--muted); }
+  .cf-CONFIRMED { background:#dff2e5; color:var(--ok); }
   pre { background:#0f1620; color:#d7e3f4; border-radius:6px; padding:10px; font-size:11.5px;
         max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-all; }
   .err { color:var(--bad); } .ok { color:var(--ok); }
@@ -74,9 +76,9 @@
     <table>
       <thead><tr>
         <th>导出标识</th><th>阶段</th><th>冻结规则摘要</th><th>输入摘要</th>
-        <th>已发布工件摘要</th><th>尝试</th><th>更新时间</th><th>操作</th>
+        <th>已发布工件摘要</th><th>接收方确认</th><th>尝试</th><th>更新时间</th><th>操作</th>
       </tr></thead>
-      <tbody id="rows"><tr><td colspan="8" class="meta">加载中…</td></tr></tbody>
+      <tbody id="rows"><tr><td colspan="9" class="meta">加载中…</td></tr></tbody>
     </table>
   </section>
 
@@ -84,6 +86,26 @@
     <h2>④ 处理日志 / 租约 <span class="meta" id="detailFor"></span></h2>
     <div id="lease" class="meta"></div>
     <pre id="events">点击列表中的“日志”查看。</pre>
+  </section>
+
+  <section class="wide">
+    <h2>⑤ 接收方稳定回执确认 <span class="meta" id="confirmFor"></span></h2>
+    <div class="meta" id="confirmView">点击列表中的“日志”选择导出后，可在此查看确认状态。</div>
+    <div id="confirmForm" hidden>
+      <p class="meta">仅 <b>PUBLISHED</b> 导出可确认；提交的工件摘要必须与该导出已核验工件摘要<b>完全一致</b>。确认只写回执，不改写下载内容、发布阶段或冻结证据。</p>
+      <div class="row">
+        <div>
+          <label for="confirmReceipt">对方确认的稳定回执标识 receipt_id</label>
+          <input type="text" id="confirmReceipt" spellcheck="false" placeholder="例如 partner-ack-20261007-001">
+        </div>
+        <div>
+          <label for="confirmDigest">对方实际核对的工件摘要（sha256）</label>
+          <input type="text" id="confirmDigest" spellcheck="false" placeholder="64 位十六进制；可使用已发布工件摘要">
+        </div>
+      </div>
+      <button id="submitConfirm">提交一次确认</button>
+      <div class="meta" id="confirmMsg"></div>
+    </div>
   </section>
 </main>
 <script>
@@ -143,18 +165,50 @@ async function refreshExports() {
   const rows = data.exports.map(e => {
     const dl = e.stage === "PUBLISHED"
       ? `<a href="/api/exports/${encodeURIComponent(e.export_id)}/artifact">下载</a>` : "—";
+    const c = e.confirmation || {};
+    const cf = c.status === "CONFIRMED"
+      ? `<span class="badge cf-CONFIRMED">已确认</span><div class="mono" style="margin-top:2px" title="回执标识 ${c.receipt_id}">${short(c.receipt_id)}</div>`
+      : `<span class="badge cf-UNCONFIRMED">未确认</span>`;
     return `<tr>
       <td class="mono">${e.export_id}</td>
       <td><span class="badge st-${e.stage}">${e.stage}</span></td>
       <td class="mono" title="${e.rules_digest}">${short(e.rules_digest)} (v${e.rules_version})</td>
       <td class="mono" title="${e.input_digest}">${short(e.input_digest)}</td>
       <td class="mono" title="${e.artifact_digest || ""}">${short(e.artifact_digest)}</td>
+      <td>${cf}</td>
       <td>${e.attempts}</td>
       <td class="mono">${e.updated_at}</td>
       <td>${dl} · <a href="#" onclick="showDetail('${e.export_id}');return false;">日志</a></td>
     </tr>`;
   }).join("");
-  $("rows").innerHTML = rows || `<tr><td colspan="8" class="meta">暂无导出。</td></tr>`;
+  $("rows").innerHTML = rows || `<tr><td colspan="9" class="meta">暂无导出。</td></tr>`;
+}
+
+let currentDetail = null;
+
+function renderConfirmation(d) {
+  currentDetail = d;
+  $("confirmFor").textContent = "— " + d.export_id;
+  const c = d.confirmation || {};
+  if (c.status === "CONFIRMED") {
+    $("confirmForm").hidden = true;
+    $("confirmView").innerHTML =
+      "<span class='badge cf-CONFIRMED'>已确认 CONFIRMED</span>"
+      + " · 确认时间 <b class='mono'>" + c.confirmed_at + "</b>"
+      + "<br>回执标识 <b class='mono'>" + c.receipt_id + "</b>"
+      + "<br>确认摘要 <b class='mono'>" + c.artifact_digest + "</b>";
+    return;
+  }
+  $("confirmView").innerHTML = "<span class='badge cf-UNCONFIRMED'>未确认 UNCONFIRMED</span>"
+    + (d.stage === "PUBLISHED"
+        ? " · 该导出已发布，可在下方提交接收方确认（仅一次）。"
+        : " · 该导出尚未发布（当前阶段 " + d.stage + "），暂不可确认。");
+  $("confirmForm").hidden = d.stage !== "PUBLISHED";
+  $("confirmMsg").textContent = "";
+  $("confirmReceipt").value = "";
+  $("confirmDigest").value = "";
+  $("confirmDigest").placeholder = d.artifact_digest
+    ? "64 位十六进制；已发布工件摘要：" + d.artifact_digest : "64 位十六进制 sha256";
 }
 
 async function showDetail(exportId) {
@@ -165,8 +219,35 @@ async function showDetail(exportId) {
     ? "当前租约持有者：<b class='mono'>" + data.lease.owner + "</b>（fencing=" + data.lease.fencing + "，到期 " + new Date(data.lease.expires_at * 1000).toISOString() + "）"
     : "当前无有效租约。";
   $("events").textContent = data.events.map(e => `${e.ts}  [${e.actor}]  ${e.event}${e.detail ? "  — " + e.detail : ""}`).join("\n") || "（无事件）";
+  renderConfirmation(data);
 }
 window.showDetail = showDetail;
+
+$("submitConfirm").onclick = async () => {
+  if (!currentDetail) return;
+  $("confirmMsg").textContent = "";
+  const payload = {
+    receipt_id: $("confirmReceipt").value.trim(),
+    artifact_digest: $("confirmDigest").value.trim().toLowerCase(),
+  };
+  const { status, data } = await api("POST",
+    "/api/exports/" + encodeURIComponent(currentDetail.export_id) + "/confirmation", payload);
+  if (status === 201) {
+    $("confirmMsg").innerHTML = "<span class='ok'>已写入确认（确认时间 " + data.confirmed_at + "）。</span>";
+    showDetail(currentDetail.export_id);
+  } else if (status === 200) {
+    $("confirmMsg").innerHTML = "<span class='ok'>相同回执与摘要的重传：返回首次确认结果（replay）。</span>";
+    showDetail(currentDetail.export_id);
+  } else {
+    const why = data.error === "digest_mismatch" ? "提交摘要与已核验工件摘要不一致"
+      : data.error === "not_published" ? "导出尚未发布"
+      : data.error === "conflict" ? "该导出已由不同回执标识或摘要确认，原确认保留"
+      : (data.message || status);
+    $("confirmMsg").innerHTML = "<span class='err'>确认冲突/被拒绝（HTTP " + status + "）：" + why + "。</span>";
+    showDetail(currentDetail.export_id);
+  }
+  refreshExports();
+};
 
 // 预填示例
 $("exportId").value = "TRACK-" + new Date().toISOString().slice(0,10).replaceAll("-","") + "-001";

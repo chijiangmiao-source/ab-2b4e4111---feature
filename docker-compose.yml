@@ -44,9 +44,13 @@ services:
     environment:
       API_BASE: "http://app:8080"
       DATA_DIR: /data
+      VERIFY_PHASE: "${VERIFY_PHASE:-main}"   # main | restart (post-restart persistence)
+      VERIFY_STATE_DIR: /verify-state
     volumes:
       - data:/data:ro
+      - verify-state:/verify-state            # shared between the main and restart runs
     restart: "no"              # one-shot: runs the acceptance suite and exits
 
 volumes:
   data:
+  verify-state:
